@@ -3,10 +3,10 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
 	"strings"
 
 	"github.com/go-telegram/bot"
@@ -64,39 +64,19 @@ func main() {
 	openAIChatModel = os.Getenv("OPENAI_CHAT_MODEL")
 	openAIBaseURL = os.Getenv("OPENAI_BASE_URL")
 
-	if len(os.Args) < 2 {
-		log.Fatal("expect input")
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+
+	opts := []bot.Option{
+		bot.WithDefaultHandler(handler),
 	}
 
-	r, err := triageMsg(os.Args[1])
+	b, err := bot.New(telegramBotToken, opts...)
 	if err != nil {
-		var e *responses.Error
-		if errors.As(err, &e) {
-			log.Printf("JSON: %v", e.RawJSON())
-			log.Printf("Response: %v", e.Response)
-			log.Fatalf("responses API error: %#v", e)
-		}
-
-		log.Fatalf("cannot triage: %#v", err)
+		log.Fatalf("cannot start telegram bot: %v", err)
 	}
 
-	printTriageInfo(os.Args[1], r)
-
-	return
-
-	// ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
-	// defer cancel()
-
-	// opts := []bot.Option{
-	// 	bot.WithDefaultHandler(handler),
-	// }
-
-	// b, err := bot.New(telegramBotToken, opts...)
-	// if err != nil {
-	// 	panic(err)
-	// }
-
-	// b.Start(ctx)
+	b.Start(ctx)
 }
 
 func handler(ctx context.Context, b *bot.Bot, update *models.Update) {
@@ -107,20 +87,25 @@ func handler(ctx context.Context, b *bot.Bot, update *models.Update) {
 	msg := update.Message.Text
 	triageResult, err := triageMsg(update.Message.Text)
 	if err != nil {
-		log.Printf("cannot triage msg: %v", err)
+		log.Printf("cannot triage message: %v", err)
 		return
 	}
 
-	printTriageInfo(msg, triageResult)
+	log.Printf("Message: %s\n%s", msg, triageResult.ToString())
 
-	// b.SendMessage(ctx, &bot.SendMessageParams{
-	// 	ChatID: update.Message.Chat.ID,
-	// 	Text:   update.Message.Text,
-	// })
-}
+	tgMsg := &bot.SendMessageParams{
+		ChatID: update.Message.Chat.ID,
+		Text:   triageResult.ToString(),
+		ReplyParameters: &models.ReplyParameters{
+			MessageID: update.Message.ID,
+			ChatID:    update.Message.Chat.ID,
+		},
+	}
 
-func printTriageInfo(msg string, r TriageResult) {
-	fmt.Printf("Message: %s\nIsIncident: %t\nSeverity: %v\nSummary: %v\nRationale: %s\nConfidence: %f\n", msg, r.IsIncident, r.Severity, r.Summary, r.Rationale, r.Confidence)
+	_, err = b.SendMessage(ctx, tgMsg)
+	if err != nil {
+		log.Printf("cannot send message: %v", err)
+	}
 }
 
 type Severity string
@@ -136,9 +121,13 @@ const (
 type TriageResult struct {
 	IsIncident bool
 	Severity   Severity
-	Summary    *string
+	Summary    string
 	Rationale  string
 	Confidence float32
+}
+
+func (r *TriageResult) ToString() string {
+	return fmt.Sprintf("IsIncident: %t\nSeverity: %v\nSummary: %v\nRationale: %s\nConfidence: %f\n", r.IsIncident, r.Severity, r.Summary, r.Rationale, r.Confidence)
 }
 
 func triageMsg(msg string) (TriageResult, error) {
@@ -161,6 +150,14 @@ func triageMsg(msg string) (TriageResult, error) {
 	if err != nil {
 		return TriageResult{}, fmt.Errorf("cannot do request to API: %w", err)
 	}
+
+	// if err != nil {
+	// 	var e *responses.Error
+	// 	if errors.As(err, &e) {
+	// 		log.Printf("JSON: %v", e.RawJSON())
+	// 		log.Printf("Response: %v", e.Response)
+	// 		log.Fatalf("responses API error: %#v", e)
+	// 	}
 
 	resp := struct {
 		CreateIncident bool    `json:"create_incident"`
@@ -192,10 +189,15 @@ func triageMsg(msg string) (TriageResult, error) {
 		severity = Unknown
 	}
 
+	summary := ""
+	if resp.Summary != nil {
+		summary = *resp.Summary
+	}
+
 	return TriageResult{
 		IsIncident: resp.CreateIncident,
 		Severity:   severity,
-		Summary:    resp.Summary,
+		Summary:    summary,
 		Rationale:  resp.Rationale,
 		Confidence: resp.Confidence,
 	}, nil
